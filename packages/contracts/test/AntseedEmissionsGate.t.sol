@@ -15,6 +15,7 @@ import { AntseedRegistry } from "../core/AntseedRegistry.sol";
 import { IAntseedUsageAccounting } from "../interfaces/IAntseedUsageAccounting.sol";
 import { IAntseedPointsPolicy } from "../interfaces/IAntseedPointsPolicy.sol";
 import { AntseedSellerRewardsPool } from "../rewards/AntseedSellerRewardsPool.sol";
+import { AntseedSellerDelegation } from "../staking/AntseedSellerDelegation.sol";
 import { MockERC8004Registry } from "./mocks/MockERC8004Registry.sol";
 
 contract MockDepositsForEmissionsGate {
@@ -54,6 +55,17 @@ contract MockUsagePointsPolicy is IAntseedPointsPolicy {
 contract MockAllowAllSellerUnlockPolicy {
     function canClaimSellerUnlocked(address) external pure returns (bool) {
         return true;
+    }
+}
+
+// Test-only wrapper around the real delegation base class.
+// DiemStakingProxy inherits this same code, so exposing the internal helper here
+// lets the test hit the production call path without setting up Diem state.
+contract SellerDelegationHarness is AntseedSellerDelegation {
+    constructor(address registry_, address operator_) AntseedSellerDelegation(registry_, operator_) { }
+
+    function pendingSellerEmissions(address account, uint256[] memory epochs) external view returns (uint256) {
+        return _pendingSellerEmissions(account, epochs);
     }
 }
 
@@ -300,6 +312,42 @@ contract AntseedEmissionsGateTest is Test {
 
         vm.expectRevert(AntseedEmissionsGate.NotLegacyEmissionsMinter.selector);
         gate.mint(buyer, 1 ether);
+    }
+
+    function test_cutoverShouldKeepSellerDelegationPendingEmissionsLookupWorking() public {
+        // This models DeployRecognizedUsage.s.sol:
+        //   1. deploy the gate,
+        //   2. deploy UsageAccounting,
+        //   3. set registry.emissions = UsageAccounting.
+        //
+        // After this line, registry.emissions() no longer points at legacyV2.
+        // It points at usageAccounting instead.
+        _deployGate(4);
+
+        // The deploy script keeps legacyV2 alive by pointing it at the gate so
+        // direct legacy claims can still mint through the new token authority.
+        legacyV2.setRegistry(address(gate));
+
+        // Prove the old legacy rewards still exist. This direct call succeeds,
+        // so the problem is not "there are no rewards".
+        uint256[] memory epochs = _epochList(2);
+        (uint256 directPending,) = legacyV2.pendingEmissions(seller, epochs);
+        assertGt(directPending, 0);
+
+        // This harness uses AntseedSellerDelegation's real implementation.
+        // DiemStakingProxy uses the same inherited helper for seller emission
+        // lookups, so this reproduces the production path with less setup.
+        SellerDelegationHarness delegation = new SellerDelegationHarness(address(realRegistry), operator);
+
+        // BUG: AntseedSellerDelegation asks registry.emissions() for the
+        // emissions contract, then calls pendingEmissions(...) on it.
+        //
+        // But after cutover registry.emissions() is UsageAccounting, and
+        // UsageAccounting only records usage. It does not implement
+        // pendingEmissions(...), so this line reverts with an unrecognized
+        // function selector instead of returning the pending reward amount.
+        uint256 delegatedPending = delegation.pendingSellerEmissions(seller, epochs);
+        assertEq(delegatedPending, (directPending * 9_000) / 10_000);
     }
 
     function test_sellerPoolsRewardsUsePostMigrationBucketAndPools() public {
